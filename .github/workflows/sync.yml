@@ -1,0 +1,145 @@
+name: Ceph RGW to S3 Scheduled Sync
+
+on:
+  schedule:
+    # Runs daily at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      source_bucket:
+        description: 'Source Bucket Name (Primary Ceph RGW)'
+        required: true
+        default: 'production-primary-assets'
+      dest_bucket:
+        description: 'Destination Bucket Name (Backup Ceph / AWS S3)'
+        required: true
+        default: 'dr-backup-assets'
+      sync_mode:
+        description: 'Sync Detection Mode'
+        type: choice
+        options:
+          - both
+          - etag
+          - timestamp
+        default: 'both'
+      dry_run:
+        description: 'Simulate without writing data (Dry Run)'
+        type: boolean
+        default: false
+      delete_orphans:
+        description: 'Purge deleted objects in destination'
+        type: boolean
+        default: false
+      workers:
+        description: 'Concurrent Worker Threads'
+        required: false
+        default: '12'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cephsync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  s3-sync:
+    name: Execute Ceph RGW Data Sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'sync_engine/requirements.txt'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r sync_engine/requirements.txt
+
+      - name: Validate Secrets & Environment
+        run: |
+          echo "Checking essential secret presence..."
+          if [ -z "${{ secrets.SOURCE_S3_ACCESS_KEY }}" ] || [ -z "${{ secrets.SOURCE_S3_SECRET_KEY }}" ]; then
+            echo "::error::Primary Ceph credentials (SOURCE_S3_ACCESS_KEY/SECRET_KEY) are missing in GitHub Secrets!"
+            exit 1
+          fi
+          if [ -z "${{ secrets.DEST_S3_ACCESS_KEY }}" ] || [ -z "${{ secrets.DEST_S3_SECRET_KEY }}" ]; then
+            echo "::error::Backup destination credentials (DEST_S3_ACCESS_KEY/SECRET_KEY) are missing in GitHub Secrets!"
+            exit 1
+          fi
+          echo "Secret presence validation successful."
+
+      - name: Execute S3 Sync Engine
+        id: run_sync
+        env:
+          SOURCE_S3_ENDPOINT_URL: ${{ secrets.SOURCE_S3_ENDPOINT_URL }}
+          SOURCE_S3_ACCESS_KEY: ${{ secrets.SOURCE_S3_ACCESS_KEY }}
+          SOURCE_S3_SECRET_KEY: ${{ secrets.SOURCE_S3_SECRET_KEY }}
+          SOURCE_S3_REGION_NAME: ${{ secrets.SOURCE_S3_REGION_NAME || 'default' }}
+          SOURCE_S3_VERIFY_SSL: ${{ secrets.SOURCE_S3_VERIFY_SSL || 'true' }}
+
+          DEST_S3_ENDPOINT_URL: ${{ secrets.DEST_S3_ENDPOINT_URL }}
+          DEST_S3_ACCESS_KEY: ${{ secrets.DEST_S3_ACCESS_KEY }}
+          DEST_S3_SECRET_KEY: ${{ secrets.DEST_S3_SECRET_KEY }}
+          DEST_S3_REGION_NAME: ${{ secrets.DEST_S3_REGION_NAME || 'us-east-1' }}
+          DEST_S3_VERIFY_SSL: ${{ secrets.DEST_S3_VERIFY_SSL || 'true' }}
+
+          LOG_LEVEL: 'INFO'
+        run: |
+          mkdir -p logs
+
+          SOURCE_B="${{ github.event.inputs.source_bucket || secrets.DEFAULT_SOURCE_BUCKET || 'production-primary-assets' }}"
+          DEST_B="${{ github.event.inputs.dest_bucket || secrets.DEFAULT_DEST_BUCKET || 'dr-backup-assets' }}"
+          SYNC_M="${{ github.event.inputs.sync_mode || 'both' }}"
+          WORKERS="${{ github.event.inputs.workers || '12' }}"
+
+          FLAGS="--source-bucket ${SOURCE_B} --dest-bucket ${DEST_B} --sync-mode ${SYNC_M} --workers ${WORKERS}"
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS="${FLAGS} --dry-run"
+          fi
+
+          if [ "${{ github.event.inputs.delete_orphans }}" = "true" ]; then
+            FLAGS="${FLAGS} --delete-orphans"
+          fi
+
+          echo "Running CephSync command: python3 sync_engine/sync_engine.py ${FLAGS}"
+          python3 sync_engine/sync_engine.py ${FLAGS} | tee logs/sync-output.jsonl
+
+      - name: Generate Workflow Markdown Summary
+        if: always()
+        run: |
+          echo "### 📦 CephSync Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Bucket | \`${{ github.event.inputs.source_bucket || 'production-primary-assets' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target Bucket | \`${{ github.event.inputs.dest_bucket || 'dr-backup-assets' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sync Mode | \`${{ github.event.inputs.sync_mode || 'both' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | \`${{ github.event.inputs.dry_run || 'false' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f logs/sync-output.jsonl ]; then
+            LAST_LINE=$(tail -n 1 logs/sync-output.jsonl)
+            echo "#### Last Engine Event" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+            echo "$LAST_LINE" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Archive JSONL Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cephsync-logs-${{ github.run_id }}
+          path: logs/sync-output.jsonl
+          retention-days: 14

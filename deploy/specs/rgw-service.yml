@@ -1,0 +1,37 @@
+---
+# ==============================================================================
+# Ceph Orchestrator Service Specification: Ceph Object Gateway (RGW)
+# ==============================================================================
+# Apply with: ceph orch apply -i deploy/specs/rgw-service.yml
+# ==============================================================================
+service_type: rgw
+service_id: rgw.default
+placement:
+  count: 3
+  label: rgw
+  hosts:
+    - ceph-node01
+    - ceph-node02
+    - ceph-node03
+spec:
+  rgw_realm: production-realm
+  rgw_zonegroup: default
+  rgw_zone: default
+  rgw_frontend_port: 8080
+  rgw_frontend_type: beast
+  ssl: false
+  # For SSL production termination, provide crt and key or set ssl: true
+  # rgw_frontend_ssl_port: 8443
+---
+# Ingress Service (HAProxy + Keepalived Virtual IP) for High Availability
+service_type: ingress
+service_id: rgw.ingress
+placement:
+  count: 3
+  label: rgw
+spec:
+  backend_service: rgw.default
+  virtual_ip: 192.168.10.100/24
+  frontend_port: 80
+  monitor_port: 1936
+  ssl_port: 443

@@ -1,0 +1,6 @@
+{
+  "name": "CephSync Enterprise - Ceph RGW Automation & S3 Sync Engine",
+  "description": "Production-ready open-source suite for automating 3-node Ceph RGW object storage deployment (ceph orch) and enterprise-grade Python S3 sync with multi-part upload, incremental sync, and GitHub Actions cron.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

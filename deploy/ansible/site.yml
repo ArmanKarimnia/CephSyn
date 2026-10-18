@@ -1,0 +1,97 @@
+---
+# ==============================================================================
+# Ansible Playbook: 3-Node Ceph RGW Orchestration
+# ==============================================================================
+- name: Bootstrap Ceph Object Gateway (RGW) on 3-Node Cluster
+  hosts: ceph_cluster
+  become: true
+  vars:
+    realm_name: "production-realm"
+    zonegroup_name: "default"
+    zone_name: "default"
+    rgw_port: 8080
+    rgw_service_id: "rgw.default"
+    rgw_admin_uid: "s3-backup-admin"
+    rgw_admin_name: "S3 Sync & Backup Service"
+
+  tasks:
+    - name: Ensure Ceph cluster is healthy
+      ansible.builtin.command: ceph health detail
+      register: ceph_health
+      changed_when: false
+      run_once: true
+
+    - name: Label cluster nodes with 'rgw' tag
+      ansible.builtin.command: "ceph orch host label add {{ inventory_hostname }} rgw"
+      register: label_res
+      changed_when: "'Added label' in label_res.stdout"
+      failed_when: false
+
+    - name: Check if RGW realm exists
+      ansible.builtin.command: "radosgw-admin realm get --rgw-realm={{ realm_name }}"
+      register: realm_check
+      failed_when: false
+      changed_when: false
+      run_once: true
+
+    - name: Create RGW realm if not present
+      ansible.builtin.command: "radosgw-admin realm create --rgw-realm={{ realm_name }} --default"
+      when: realm_check.rc != 0
+      run_once: true
+
+    - name: Configure and commit RGW zonegroup & zone topology
+      run_once: true
+      block:
+        - name: Create or update default zonegroup
+          ansible.builtin.command: >
+            radosgw-admin zonegroup create
+            --rgw-realm={{ realm_name }}
+            --rgw-zonegroup={{ zonegroup_name }}
+            --endpoints={% for host in groups['ceph_cluster'] %}http://{{ hostvars[host]['ansible_host'] | default(host) }}:{{ rgw_port }}{% if not loop.last %},{% endif %}{% endfor %}
+            --master --default
+          register: zg_create
+          failed_when: false
+
+        - name: Create or update default zone
+          ansible.builtin.command: >
+            radosgw-admin zone create
+            --rgw-realm={{ realm_name }}
+            --rgw-zonegroup={{ zonegroup_name }}
+            --rgw-zone={{ zone_name }}
+            --endpoints={% for host in groups['ceph_cluster'] %}http://{{ hostvars[host]['ansible_host'] | default(host) }}:{{ rgw_port }}{% if not loop.last %},{% endif %}{% endfor %}
+            --master --default
+          register: z_create
+          failed_when: false
+
+        - name: Commit RGW period
+          ansible.builtin.command: radosgw-admin period update --commit
+
+    - name: Apply RGW service specification via Ceph Orchestrator
+      ansible.builtin.command: >
+        ceph orch apply rgw {{ rgw_service_id }}
+        --realm={{ realm_name }}
+        --zone={{ zone_name }}
+        --placement="3 {{ groups['ceph_cluster'] | join(' ') }}"
+        --port={{ rgw_port }}
+      run_once: true
+
+    - name: Create dedicated S3 synchronization system user
+      ansible.builtin.command: >
+        radosgw-admin user create
+        --uid={{ rgw_admin_uid }}
+        --display-name="{{ rgw_admin_name }}"
+        --system
+      register: user_create
+      failed_when: false
+      run_once: true
+
+    - name: Output RGW status
+      ansible.builtin.command: ceph orch ps --daemon-type rgw
+      register: rgw_ps
+      changed_when: false
+      run_once: true
+
+    - name: Display RGW Orchestrator Daemons
+      ansible.builtin.debug:
+        var: rgw_ps.stdout_lines
+      run_once: true
